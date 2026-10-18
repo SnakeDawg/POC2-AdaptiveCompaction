@@ -164,14 +164,35 @@ def tool_search(query: str) -> str:
 # ---------------------------------------------------------------------------
 
 class ReActAgent:
-    """A minimal ReAct agent -- the foundation we'll build compaction on."""
+    """A ReAct agent with pluggable context-compaction policies.
+
+    Policies:
+        "none"   -- No compaction (baseline, Phase 1)
+        "fixed"  -- Compress every N tool calls (Phase 2)
+        "selfcompact" -- Compress only when the rubric says so (Phase 3+)
+
+    After compaction, the message list is reset to:
+        [system, user(question), assistant(summary), user(continue)]
+
+    This is exactly how SelfCompact works: the model summarizes its own
+    context, and generation resumes from the compressed prefix.
+    """
 
     def __init__(self, api_base: str = "http://127.0.0.1:8000/v1",
                  model: str = "nvidia/Qwen3.6-35B-A3B-NVFP4",
-                 max_tool_calls: int = 20):
+                 max_tool_calls: int = 20,
+                 policy: str = "none",
+                 summarize_every_n_calls: int = 3,
+                 context_budget: int = 50000):
         self.api_base = api_base
         self.model = model
         self.max_tool_calls = max_tool_calls
+
+        # --- Compaction policy ---
+        self.policy = policy  # "none" | "fixed" | "selfcompact"
+        self.summarize_every_n_calls = summarize_every_n_calls  # For "fixed"
+        self.context_budget = context_budget  # Hard limit (tokens)
+        self.summarize_count = 0  # How many times we've compressed
 
         # The conversation history
         self.messages: List[Dict[str, Any]] = []
@@ -264,18 +285,132 @@ class ReActAgent:
                 total += len(str(content))
         return total // 4  # Rough estimate: 4 chars per token
 
+    # ---------------------------------------------------------------------------
+    # Compaction methods (Phase 2+: fixed, selfcompact, adaptive)
+    # ---------------------------------------------------------------------------
+
+    def _decide_compaction(self, token_count: int) -> Tuple[bool, str]:
+        """
+        Decide whether to compress now, per the active policy.
+
+        Returns (fire: bool, reason: str).
+
+        This is where the policy branch happens:
+        - "none": never fire
+        - "fixed": fire every N tool calls (after summarizations)
+        - "selfcompact": would fire the rubric (Phase 3)
+
+        Key learning from SelfCompact: fixed-interval is a dumb clock.
+        It fires regardless of what the model is doing. This is the
+        problem that adaptive compaction solves.
+        """
+        if self.policy == "none":
+            return False, ""
+
+        if self.policy == "fixed":
+            # Count actual tool calls since last compaction
+            tool_calls_since_last = (
+                self.tool_call_count - self.summarize_count * self.summarize_every_n_calls
+            )
+            if tool_calls_since_last >= self.summarize_every_n_calls:
+                return True, f"fixed:every_{self.summarize_every_n_calls}_calls"
+            return False, ""
+
+        if self.policy == "selfcompact":
+            # Would call the rubric here (Phase 3)
+            return False, "rubric-not-implemented-yet"
+
+        return False, ""
+
+    async def _summarize(self, question: str) -> Tuple[str, int]:
+        """
+        Ask the model to summarize its own context.
+
+        This is the core of compaction: the model writes a summary of
+        everything up to this point, then we replace the full history
+        with [system, question, summary, "continue"].
+
+        IMPORTANT: The model is its OWN summarizer. Same model, no fine-tuning.
+        This is what makes SelfCompact elegant -- we're not adding external logic,
+        just prompting the model to reflect on its own work.
+
+        Returns: (summary_text, summary_token_count)
+        """
+        # Build the summarize prompt -- appended to the full trajectory
+        # so the model can see all context while summarizing
+        sum_prompt = (
+            "You are summarizing your own research. Compress the conversation "
+            "above into a concise summary that captures all essential findings. "
+            "Include:\n"
+            "1. What you've learned (specific facts, numbers, URLs)\n"
+            "2. What you've tried (failed approaches, dead ends)\n"
+            "3. What remains to be done\n"
+            "\n"
+            "Format:\n"
+            "## Summary\n"
+            "[Your research summary here]"
+        )
+
+        sum_messages = self.messages + [
+            {"role": "user", "content": f"{sum_prompt}\n\nQuestion: {question}"}
+        ]
+
+        # Call the model with no tools -- it's just writing a summary
+        response = await self.call_model(
+            sum_messages,
+            tools=None,  # No tools during summarization
+            max_tokens=4096,
+        )
+
+        summary = (response.choices[0].message.get("content") or "").strip()
+        summary_tokens = self.count_tokens_est([{"role": "assistant", "content": summary}])
+
+        return summary, summary_tokens
+
+    def _reset_after_summarize(self, question: str, summary: str) -> int:
+        """
+        Replace the full conversation with a compacted version.
+
+        After summarization, the new message list is:
+            [system, user(question), assistant(summary), user(continue)]
+
+        This is exactly how SelfCompact resets its context. The model
+        then continues as if it had always seen only the summary.
+
+        Returns: token_count after reset (for tracking)
+        """
+        # Keep the prefix (system + question) and add the summary + continue
+        new_messages = list(self.prefix_messages)  # Copy system + question
+        new_messages.append({
+            "role": "assistant",
+            "content": f"Here is my research so far:\\n{summary}"
+        })
+        new_messages.append({
+            "role": "user",
+            "content": "Continue your research. Use your tools to find the answer, "
+                       "or provide your final answer if you have enough information."
+        })
+
+        self.messages = new_messages
+        return self.count_tokens_est(self.messages)
+
+    # ---------------------------------------------------------------------------
+    # Run loop (updated with compaction)
+    # ---------------------------------------------------------------------------
+
     async def run(self, question: str) -> Dict[str, Any]:
         """
-        Run the ReAct loop. This is the core of Phase 1.
+        Run the ReAct loop with optional compaction.
 
         The loop:
           1. Send messages to the model
           2. Check if the response has a tool call or a final answer
-          3. If tool call: execute it, add result to messages, repeat
-          4. If answer: stop and return the result
+          3. If tool call: execute it, add result to messages, check compaction
+          4. If compaction fires: summarize, reset messages, continue
+          5. If answer: stop and return the result
 
-        No compaction yet -- this is the "none" policy baseline.
-        We'll add compaction in Phase 2.
+        Compaction is checked ONLY after a tool call returns (not after
+        the model's own reasoning), matching SelfCompact's design.
         """
         # Initialize with system prompt + question
         self.messages = [
@@ -293,6 +428,7 @@ class ReActAgent:
         self.prefix_messages = copy.deepcopy(self.messages)
         self.tool_call_count = 0
         self.iteration = 0
+        self.summarize_count = 0
         self.debug_data: Dict[str, Any] = {
             "iterations": [],
             "tool_calls": [],
@@ -311,6 +447,22 @@ class ReActAgent:
             self.debug_data["token_counts"].append(token_count)
             print(f"  Context: {token_count:,} estimated tokens, "
                   f"{len(self.messages)} messages")
+
+            # Hard capacity guard (Phase 5): stop if context is too large
+            if token_count >= self.context_budget:
+                print(f"  [CAPACITY] Context ({token_count:,} tokens) exceeds budget "
+                      f"({self.context_budget:,}). Forcing final answer.")
+                self.messages.append({
+                    "role": "user",
+                    "content": "You have reached the maximum length limit. Based on the "
+                               "information above, commit to your single best-guess final "
+                               "answer right now using the format: ANSWER: <your answer>."
+                })
+                response = await self.call_model(
+                    self.messages, tools=None, max_tokens=2048
+                )
+                final_content = (response.choices[0].message.get("content") or "").strip()
+                break
 
             response = await self.call_model(
                 self.messages, tools=self.tools, max_tokens=4096
@@ -361,6 +513,32 @@ class ReActAgent:
                     "role": "tool_call",
                 })
 
+                # --- Compaction decision (after every tool call) ---
+                if self.policy != "none":
+                    fire, reason = self._decide_compaction(token_count)
+                    if fire:
+                        print(f"  [COMPACT] Compaction triggered: {reason}")
+
+                        # Summarize
+                        summary, sum_tokens = await self._summarize(question)
+                        print(f"  [COMPACT] Summary: {summary[:100]}...")
+
+                        # Reset
+                        tokens_after = self._reset_after_summarize(question, summary)
+                        self.summarize_count += 1
+
+                        self.debug_data["compaction_events"].append({
+                            "iteration": self.iteration,
+                            "tokens_before": token_count,
+                            "tokens_after": tokens_after,
+                            "summary_tokens": sum_tokens,
+                            "reason": reason,
+                            "summary": summary,
+                        })
+                        print(f"  [COMPACT] Compressed {token_count:,} -> "
+                              f"{tokens_after:,} tokens (iter {self.iteration})")
+                        continue
+
             else:
                 # No tool call -- the model is providing a final answer
                 print(f"  -> Final answer: {content[:200]}...")
@@ -376,5 +554,6 @@ class ReActAgent:
             "answer": final_content,
             "iterations": self.iteration,
             "tool_calls": self.tool_call_count,
+            "summarizations": self.summarize_count,
             "debug_data": self.debug_data,
         }
