@@ -40,70 +40,123 @@ import litellm
 
 
 def tool_search(query: str) -> str:
-    """Simulates a web search. Returns synthetic results."""
-    # These are pre-written "knowledge" -- in a real agent this would be a live search
-    knowledge = {
-        "q1": {
-            "result_1": (
-                "Source: Wikipedia\n"
-                "'The Great Barrier Reef is the world's largest coral reef system, "
-                "spanning over 2,300 kilometers off the coast of Queensland, Australia. "
-                "It is visible from space and is the world's largest living structure.'"
-            ),
-            "result_2": (
-                "Source: NOAA\n"
-                "'The Great Barrier Reef is home to at least 1,500 species of fish, "
-                "400 types of coral, and a variety of other marine life including "
-                "sea turtles, dugongs, and sharks.'"
-            ),
-            "result_3": "No relevant results found."
-        },
-        "q2": {
-            "result_1": (
-                "Source: Nature\n"
-                "'CRISPR-Cas9 is a simplified version of a naturally occurring "
-                "genomic defense system in bacteria. The bacteria harvest small "
-                "pieces of DNA from viruses they have encountered, and use them "
-                "to create DNA segments known as CRISPR arrays.'"
-            ),
-            "result_2": (
-                "Source: NCBI\n"
-                "'CRISPR-based gene editing has been applied in human cells with "
-                "high precision. The system uses a guide RNA (gRNA) to direct "
-                "Cas9 nuclease to a specific DNA sequence.'"
-            ),
-            "result_3": "No relevant results found."
-        },
-        "q3": {
-            "result_1": (
-                "Source: NASA\n"
-                "'Mars has two natural satellites: Phobos and Deimos. "
-                "Phobos is the larger and closer moon, orbiting at just "
-                "6,000 km above the surface. It completes three orbits "
-                "per Martian day.'"
-            ),
-            "result_2": (
-                "Source: ESA\n"
-                "'Phobos is expected to either crash into Mars or break "
-                "apart into a ring system within the next 50 million years "
-                "due to its decaying orbit.'"
-            ),
-            "result_3": "No relevant results found."
-        },
-    }
+    """Simulates a web search. Returns synthetic results.
 
-    # Simple keyword matching
-    q_key = "q1"
-    if "mars" in query.lower() or "moon" in query.lower() or "phobos" in query.lower():
-        q_key = "q3"
-    elif "crispr" in query.lower() or "gene" in query.lower() or "dna" in query.lower():
-        q_key = "q2"
+    The search is keyword-sensitive: different queries return different results.
+    If the query contains a unique keyword, it gets unique results.
+    If the query is a repeat (contains only common words), it returns "no new info".
+    """
+    q_lower = query.lower()
 
-    return json.dumps(knowledge.get(q_key, {
-        "result_1": "No relevant results found.",
-        "result_2": "No relevant results found.",
-        "result_3": "No relevant results found."
-    }))
+    # Check for unique keywords to determine which "page" to return
+    reef_queries = ["reef", "coral", "great barrier", "australia"]
+    crispr_queries = ["crispr", "gene", "dna", "editing", "cas9"]
+    mars_queries = ["mars", "phobos", "deimos", "moon", "satellite"]
+
+    def count_matches(words, text):
+        return sum(1 for w in words if w in text)
+
+    reef_score = count_matches(reef_queries, q_lower)
+    crispr_score = count_matches(crispr_queries, q_lower)
+    mars_score = count_matches(mars_queries, q_lower)
+
+    if reef_score > crispr_score and reef_score > mars_score:
+        # For reef, check if query seems "fresh" (has specific sub-terms)
+        specific_terms = ["size", "area", "km", "species", "fish", "turtle", "marine", "living", "structure"]
+        has_specific = sum(1 for t in specific_terms if t in q_lower)
+
+        if has_specific >= 2:
+            # Different aspects of the reef — return different results
+            if any(t in q_lower for t in ["size", "area", "km"]):
+                return json.dumps({
+                    "result_1": "Source: Wikipedia\n'The Great Barrier Reef is the world's largest coral reef "
+                                "system, spanning over 2,300 kilometers (1,430 miles) and covering an area "
+                                "of approximately 344,400 square kilometers. It extends from 126 to 383 "
+                                "kilometers offshore.'"
+                })
+            elif any(t in q_lower for t in ["species", "fish", "marine", "turtl"]):
+                return json.dumps({
+                    "result_1": "Source: NOAA\n'The Great Barrier Reef is home to at least 1,500 species of fish, "
+                                "400 types of coral, and a variety of other marine life including "
+                                "sea turtles, dugongs, whales, and sharks. Over 900 species of mollusc "
+                                "are known to live on the reef.'"
+                })
+            else:
+                return json.dumps({
+                    "result_1": "Source: UNESCO\n'The Great Barrier Reef is visible from space and is the "
+                                "world's largest living structure. It was declared a World Heritage "
+                                "Site in 1981 and is recognized for its outstanding universal value.'"
+                })
+        else:
+            # Generic search — same result (simulating repeated searches)
+            return json.dumps({
+                "result_1": "Source: Wikipedia\n'The Great Barrier Reef is the world's largest coral reef system, "
+                            "spanning over 2,300 kilometers. It is visible from space and is the world's "
+                            "largest living structure.'"
+            })
+
+    elif crispr_score > reef_score and crispr_score > mars_score:
+        specific_terms = ["how", "work", "mechanism", "guide", "rna", "application", "precision", "bacteria"]
+        has_specific = sum(1 for t in specific_terms if t in q_lower)
+
+        if has_specific >= 1:
+            if any(t in q_lower for t in ["how", "work", "mechanism"]):
+                return json.dumps({
+                    "result_1": "Source: Nature\n'CRISPR-Cas9 is a simplified version of a naturally occurring "
+                                "genomic defense system in bacteria. The bacteria harvest small pieces of DNA "
+                                "from viruses they have encountered, and use them to create DNA segments "
+                                "known as CRISPR arrays. The system uses a guide RNA (gRNA) to direct Cas9 "
+                                "nuclease to a specific DNA sequence for editing.'"
+                })
+            elif any(t in q_lower for t in ["application", "precision", "human"]):
+                return json.dumps({
+                    "result_1": "Source: NCBI\n'CRISPR-based gene editing has been applied in human cells with "
+                                "high precision. Key applications include treating genetic disorders (sickle cell "
+                                "disease, beta-thalassemia), cancer therapy research, and agricultural "
+                                "improvements. The system enables targeted modification of DNA sequences.'"
+                })
+            else:
+                return json.dumps({
+                    "result_1": "Source: Wikipedia\n'CRISPR-Cas9 is a gene-editing technology that allows "
+                                "scientists to modify an organism's DNA with high precision. The name is an "
+                                "acronym for Clustered Regularly Interspaced Short Palindromic Repeats.'"
+                })
+        else:
+            return json.dumps({
+                "result_1": "Source: Nature\n'CRISPR-Cas9 is a simplified version of a naturally occurring "
+                            "genomic defense system in bacteria.'"
+            })
+
+    elif mars_score > 0:
+        specific_terms = ["phobos", "deimos", "size", "orbit", "mass", "fate", "crash", "ring", "dimension"]
+        has_specific = sum(1 for t in specific_terms if t in q_lower)
+
+        if has_specific >= 2:
+            if "phobos" in q_lower and any(t in q_lower for t in ["orbit", "period", "day"]):
+                return json.dumps({
+                    "result_1": "Source: NASA\n'Phobos is the larger and closer Martian moon, orbiting at just "
+                                "6,000 km above the surface. It completes three orbits per Martian day. "
+                                "Phobos is irregularly shaped with dimensions approximately 27 x 22 x 18 km.'"
+                })
+            elif "phobos" in q_lower and any(t in q_lower for t in ["fate", "crash", "ring", "orbit"]):
+                return json.dumps({
+                    "result_1": "Source: ESA\n'Phobos is expected to either crash into Mars or break apart "
+                                "into a ring system within the next 50 million years due to its decaying orbit. "
+                                "It is spiraling inward at about 1.8 cm per year.'"
+                })
+            else:
+                return json.dumps({
+                    "result_1": "Source: NASA\n'Mars has two natural satellites: Phobos (larger, 27km long) and "
+                                "Deimos (smaller, 12km long). Phobos orbits at 6,000 km; Deimos at 20,000 km. "
+                                "Both are thought to be captured asteroids.'"
+                })
+        else:
+            return json.dumps({
+                "result_1": "Source: NASA\n'Mars has two moons: Phobos and Deimos.'"
+            })
+
+    # Default fallback
+    return json.dumps({"result_1": "No relevant results found.", "result_2": "No relevant results found."})
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +203,11 @@ class ReActAgent:
                          tools: Optional[List[Dict]] = None,
                          max_tokens: int = 4096) -> Dict[str, Any]:
         """Call the LLM API. Returns the raw response."""
+        # Pass a dummy api_key -- required by litellm even for local vLLM
         response = await litellm.acompletion(
             model=f"openai/{self.model}",
             api_base=self.api_base,
+            api_key="EMPTY",
             messages=messages,
             tools=tools,
             max_tokens=max_tokens,

@@ -1,13 +1,21 @@
+#!/usr/bin/env python3
 """
 Phase 1 Runner: Test the bare ReAct agent (no compaction)
 
-This script exercises the agent on synthetic tasks and prints the results.
-Run it after starting vLLM on port 8000.
+Uses the ailab gateway venv which has litellm installed.
 """
 
 import asyncio
 import json
+import os
 import sys
+
+# Use the ailab gateway venv's Python for litellm access
+VENV_PYTHON = os.path.join(os.path.expanduser("~"), "ailab/repos/gateway/.venv/bin/python3")
+PYTHON_PATH = os.path.join(
+    os.path.expanduser("~"), "ailab/repos/gateway/.venv/lib/python3.12/site-packages"
+)
+sys.path.insert(0, PYTHON_PATH)
 
 from agent import ReActAgent
 from synthetic_tasks import get_tasks, evaluate_answer
