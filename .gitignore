@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+output_*.json
+analysis_*.json

@@ -15,7 +15,7 @@ context, and generation resumes from the compressed prefix.
 
 import json
 import copy
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import litellm
 
@@ -188,8 +188,13 @@ class ReActAgent:
         self.tool_call_count = 0
         self.iteration = 0
 
+        # --- SelfCompact state (Phase 3) ---
+        self.search_history: List[Dict[str, str]] = []  # (query, result_hash) for N1
+        self.rubric_results: List[Dict[str, Any]] = []  # log of rubric checks
+        self.rubric_check_every_n_calls: int = 3  # check rubric every N tool calls
+
     def call_model(self, messages: List[Dict[str, Any]],
-                   tools: List[Dict] = None,
+                   tools: Optional[List[Dict]] = None,
                    max_tokens: int = 4096) -> Any:
         """Call the LLM API. Returns the response object."""
         response = litellm.completion(
@@ -237,6 +242,91 @@ class ReActAgent:
     # Compaction methods
     # ---------------------------------------------------------------------------
 
+    def _check_rubric(self, question: str) -> Dict[str, Any]:
+        """
+        Self-assess using the SelfCompact rubric before compaction.
+
+        Returns a dict with C3, N1, C1, C2 scores and a recommendation.
+        """
+        rubric_prompt = (
+            "You are self-evaluating your research progress. "
+            "Answer these rubric rules honestly based on your conversation history.\n\n"
+            "QUESTION: {question}\n\n"
+            "RECENT TOOL CALLS:\n{recent_calls}\n\n"
+            "RULES:\n"
+            "C3 (Progress): Did my latest action make real progress toward answering the question? "
+            "True if I learned something new, False if I repeated the same search or got similar info.\n"
+            "N1 (Not Stuck): Have 3+ of my last 4 searches returned nothing new? "
+            "True = stuck in a loop, False = making progress.\n"
+            "C1 (Coverage): Does my context contain enough information to answer? "
+            "Score 0-5: 0=missing everything, 5=have all needed info.\n"
+            "C2 (Recency): Am I relying on old/irrelevant info from early in the conversation? "
+            "Score 0-5: 0=all stale, 5=all relevant and recent.\n\n"
+            "OUTPUT FORMAT (JSON only, no markdown):\n"
+            '{{\n  "C3_progress": true/false,\n  "N1_stuck": true/false,\n'
+            '  "C1_coverage": <0-5>,\n'
+            '  "C2_recency": <0-5>,\n'
+            '  "reason": "brief explanation"\n}}'
+        )
+
+        # Gather recent tool calls (last 4)
+        recent_calls = ""
+        if self.search_history:
+            for i, call in enumerate(self.search_history[-4:]):
+                recent_calls += f"- Search: \"{call['query']}\"\n"
+                # Truncate result to last 200 chars to save tokens
+                result_preview = call['result'][-200:] if len(call['result']) > 200 else call['result']
+                recent_calls += f"  Result: {result_preview}\n\n"
+        if not recent_calls:
+            recent_calls = "(no tool calls yet)"
+
+        rubric_msg = rubric_prompt.format(
+            question=question,
+            recent_calls=recent_calls,
+        )
+
+        try:
+            response = self.call_model(
+                self.messages + [{"role": "user", "content": rubric_msg}],
+                tools=None,
+                max_tokens=1024,
+            )
+            content = response.choices[0].message.get("content") or ""
+
+            # Parse JSON from the response
+            import re
+            json_match = re.search(r'\{[^}]*\}', content, re.DOTALL)
+            if json_match:
+                rubric_result = json.loads(json_match.group())
+            else:
+                rubric_result = {
+                    "C3_progress": True,  # default: assume progress if can't parse
+                    "N1_stuck": False,
+                    "C1_coverage": 3,
+                    "C2_recency": 3,
+                    "reason": "rubric parse fallback",
+                }
+
+            # Ensure required keys
+            rubric_result.setdefault("C3_progress", True)
+            rubric_result.setdefault("N1_stuck", False)
+            rubric_result.setdefault("C1_coverage", 3)
+            rubric_result.setdefault("C2_recency", 3)
+            rubric_result.setdefault("reason", "")
+
+            self.rubric_results.append(rubric_result)
+            return rubric_result
+
+        except Exception as e:
+            # On failure, default to safe: don't compress, keep searching
+            return {
+                "C3_progress": True,
+                "N1_stuck": False,
+                "C1_coverage": 3,
+                "C2_recency": 3,
+                "reason": f"rubric_error: {e}",
+            }
+
     def _decide_compaction(self, token_count: int) -> Tuple[bool, str]:
         """Decide whether to compress now, per the active policy."""
         if self.policy == "none":
@@ -251,7 +341,39 @@ class ReActAgent:
             return False, ""
 
         if self.policy == "selfcompact":
-            return False, "rubric-not-implemented-yet"
+            # SelfCompact: check rubric first, only compress if justified
+            if (self.tool_call_count - self.summarize_count * self.rubric_check_every_n_calls
+                    >= self.rubric_check_every_n_calls):
+
+                rubric = self._check_rubric(
+                    # Extract question from prefix_messages
+                    self.prefix_messages[1].get("content", "") if len(self.prefix_messages) > 1 else ""
+                )
+
+                c3 = rubric.get("C3_progress", True)
+                n1_stuck = rubric.get("N1_stuck", False)
+                c1_cov = rubric.get("C1_coverage", 3)
+
+                if n1_stuck:
+                    # N1: model is stuck in a loop — don't compress, force answer
+                    return True, f"selfcompact:N1_stuck(need_answer)"
+
+                if not c3:
+                    # C3: no progress — compress now to break the loop
+                    # (the summary will capture what's already known)
+                    return True, f"selfcompact:C3_no_progress"
+
+                if c1_cov >= 4:
+                    # C1: high coverage — enough info, compress to free budget
+                    return True, f"selfcompact:C1_coverage_{c1_cov}/5"
+
+                if token_count > self.context_budget * 0.7:
+                    # Context is getting large, compress if rubric is positive
+                    if c3 and c1_cov >= 2:
+                        return True, f"selfcompact:C3+C1_budget_guard"
+
+                # Default: don't compress, keep gathering info
+                return False, "selfcompact:rubric_nocompress"
 
         return False, ""
 
@@ -326,11 +448,14 @@ class ReActAgent:
         self.tool_call_count = 0
         self.iteration = 0
         self.summarize_count = 0
+        self.search_history: List[Dict[str, str]] = []  # for N1 detection
+        self.rubric_results: List[Dict[str, Any]] = []  # log rubric checks
         self.debug_data: Dict[str, Any] = {
             "iterations": [],
             "tool_calls": [],
             "token_counts": [],
             "compaction_events": [],
+            "rubric_checks": [],  # Phase 3: rubric evaluation at each decision point
         }
 
         final_content = ""
@@ -397,24 +522,59 @@ class ReActAgent:
 
                 # --- Compaction decision ---
                 if self.policy != "none":
+                    # Track search history for N1 detection (selfcompact)
+                    if tool_name == "search":
+                        self.search_history.append({
+                            "query": tool_args.get("query", ""),
+                            "result": result[:200],  # truncated for logging
+                        })
+
                     fire, reason = self._decide_compaction(token_count)
                     if fire:
                         print(f"  [COMPACT] {reason}")
-                        summary, sum_tokens = self._summarize(question)
-                        print(f"  [COMPACT] Summary: {summary[:100]}...")
-                        tokens_after = self._reset_after_summarize(question, summary)
-                        self.summarize_count += 1
 
-                        self.debug_data["compaction_events"].append({
-                            "iteration": self.iteration,
-                            "tokens_before": token_count,
-                            "tokens_after": tokens_after,
-                            "summary_tokens": sum_tokens,
-                            "reason": reason,
-                            "summary": summary,
-                        })
-                        print(f"  [COMPACT] {token_count:,} -> {tokens_after:,} tokens")
-                        continue
+                        # Extract rubric results for logging
+                        rubric_log = []
+                        if self.policy == "selfcompact" and self.rubric_results:
+                            rubric_log = self.rubric_results[-1:]  # most recent check
+
+                        self.debug_data["rubric_checks"].extend(rubric_log)
+
+                        if "N1_stuck" in reason:
+                            # N1: model is stuck, force answer instead of summarizing
+                            print(f"  [N1] Model stuck in loop — forcing answer.")
+                            self.messages.append({
+                                "role": "user",
+                                "content": (
+                                    "You have repeated the same search multiple times without new info. "
+                                    "Stop searching and provide your best answer as: ANSWER: <your answer>."
+                                ),
+                            })
+                            response = self.call_model(
+                                self.messages, tools=None, max_tokens=2048
+                            )
+                            final_content = (response.choices[0].message.get("content") or "").strip()
+                            self.debug_data["iterations"].append({
+                                "iteration": self.iteration,
+                                "role": "forced_answer_N1",
+                            })
+                            break
+                        else:
+                            summary, sum_tokens = self._summarize(question)
+                            print(f"  [COMPACT] Summary: {summary[:100]}...")
+                            tokens_after = self._reset_after_summarize(question, summary)
+                            self.summarize_count += 1
+
+                            self.debug_data["compaction_events"].append({
+                                "iteration": self.iteration,
+                                "tokens_before": token_count,
+                                "tokens_after": tokens_after,
+                                "summary_tokens": sum_tokens,
+                                "reason": reason,
+                                "summary": summary,
+                            })
+                            print(f"  [COMPACT] {token_count:,} -> {tokens_after:,} tokens")
+                            continue
 
             else:
                 print(f"  -> Final answer: {content[:200]}...")
